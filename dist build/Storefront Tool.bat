@@ -1,0 +1,1 @@
+cd bin && cmd /k "storefront.exe"

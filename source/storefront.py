@@ -503,7 +503,7 @@ def push(local_path, add_only=False):
     root_json = f"{root_drive_path}/{name}.json"
 
     # Ensure root JSON exists
-    resolve_drive_path(root_drive_path)
+    storefront_id = resolve_drive_path(root_drive_path)
     if resolve_drive_path(root_json) is None:
         add_file(root_json)
 
@@ -643,6 +643,7 @@ def push(local_path, add_only=False):
                 write(folder_json, dict_to_json(parent_dict).encode("utf-8"))
 
             delete(file)
+    return storefront_id
 
 def add_files(local_path):
     files = get_files(local_path)
@@ -668,17 +669,18 @@ def add_files(local_path):
         print(f"Added file: {drive_file_path}")
 
 if __name__ == "__main__":
+    usage = "Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>\nstorefront login\nstorefront logout"
     if (len(sys.argv) == 1):
-        print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+        print(usage)
         sys.exit(0)
     elif (sys.argv[1] == "logout" or sys.argv[1] == "login"):
         pass
     elif (len(sys.argv) < 3 or len(sys.argv) > 4):
-        print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+        print(usage)
         sys.exit(0)
     elif (len(sys.argv) == 4):
         if (sys.argv[3] != "--add-only"):
-            print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+            print(usage)
             sys.exit(0)
     command = sys.argv[1]
     if (command != "logout"):
@@ -688,7 +690,7 @@ if __name__ == "__main__":
                 dst.write(src.read())
             os.remove(SCRIPT_DIR / "token.json")
         if (command == "login"):
-            print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+            print(usage)
             sys.exit(0)
     for i in range(10):
         try:
@@ -702,7 +704,8 @@ if __name__ == "__main__":
             elif (command == "push"):
                 local_path = sys.argv[2]
                 add_only = (len(sys.argv) == 4 and sys.argv[3] == "--add-only")
-                push(local_path, add_only)
+                storefront_id = push(local_path, add_only)
+                print(f"Storefront updated. ID reminder: {storefront_id}\n Feel free to DM the ID to the dev (https://discord.com/users/756198884233183262) for it to be added to the hub.")
                 sys.exit(0)
             elif (command == "delete"):
                 local_path = sys.argv[2]
