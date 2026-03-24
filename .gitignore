@@ -1,0 +1,11 @@
+# PyInstaller build artifacts
+build/
+dist/
+
+# PyInstaller logs and temporary files
+*.manifest
+*.spec
+
+# Optional: If you want to keep your .spec file for consistent builds, 
+# use a negation rule or simply don't include '*.spec' above.
+# !my_app.spec 
