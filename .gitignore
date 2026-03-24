@@ -1,6 +1,7 @@
 # PyInstaller build artifacts
 build/
 dist/
+.vscode/
 
 # PyInstaller logs and temporary files
 *.manifest
