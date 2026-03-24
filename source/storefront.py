@@ -32,6 +32,13 @@ FILE_LOCATIONS = json.loads((SCRIPT_DIR / "file_locations.json").read_text())
 
 def auth():
     token_path = SCRIPT_DIR / "token.json"
+    a = input("Would you like to use a public account? (Y/N):") 
+    if a == "Y":
+        with open(SCRIPT_DIR / "public_token.json", "rb") as src, open(token_path, "wb") as dst:
+            dst.write(src.read())
+    elif Path.exists(SCRIPT_DIR / "private_token.json"):
+            with open(SCRIPT_DIR / "private_token.json", "rb") as src, open(SCRIPT_DIR / "token.json", "wb") as dst:
+                dst.write(src.read())
     secret_path = SCRIPT_DIR / "client_secret.json"
 
     if token_path.exists():
@@ -40,10 +47,10 @@ def auth():
         flow = InstalledAppFlow.from_client_secrets_file(secret_path, SCOPES)
         creds = flow.run_local_server(port=0)
         token_path.write_text(creds.to_json())
-
+    if (a == "Y"):
+        os.remove(token_path)
     return build("drive", "v3", credentials=creds)
 
-drive = auth()
 
 if (TRACE_API_CALLS):
     orig_files = drive.files  # this is a callable that returns a FilesResource
@@ -661,16 +668,30 @@ def add_files(local_path):
         print(f"Added file: {drive_file_path}")
 
 if __name__ == "__main__":
+    if (len(sys.argv) == 1):
+        print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+        sys.exit(0)
+    elif (sys.argv[1] == "logout" or sys.argv[1] == "login"):
+        pass
+    elif (len(sys.argv) < 3 or len(sys.argv) > 4):
+        print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+        sys.exit(0)
+    elif (len(sys.argv) == 4):
+        if (sys.argv[3] != "--add-only"):
+            print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+            sys.exit(0)
+    command = sys.argv[1]
+    if (command != "logout"):
+        drive = auth()
+        if Path.exists(SCRIPT_DIR / "token.json"):
+            with open(SCRIPT_DIR / "token.json", "rb") as src, open(SCRIPT_DIR / "private_token.json", "wb") as dst:
+                dst.write(src.read())
+            os.remove(SCRIPT_DIR / "token.json")
+        if (command == "login"):
+            print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+            sys.exit(0)
     for i in range(10):
         try:
-            if (len(sys.argv) < 3 or len(sys.argv) > 4):
-                print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
-                sys.exit(0)
-            elif (len(sys.argv) == 4):
-                if (sys.argv[3] != "--add-only"):
-                    print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
-                    sys.exit(0)
-            command = sys.argv[1]
             if (command == "create"):
                 local_path = sys.argv[2]
                 storefront_id = create_structure(local_path)
@@ -687,6 +708,11 @@ if __name__ == "__main__":
                 local_path = sys.argv[2]
                 add_only = (len(sys.argv) == 4 and sys.argv[3] == "--add-only")
                 delete(local_path, add_only)
+                sys.exit(0)
+            elif (command == "logout"):
+                if (Path.exists(SCRIPT_DIR / "private_token.json")):
+                    os.remove(SCRIPT_DIR / "private_token.json")
+                print("Logged out.")
                 sys.exit(0)
         except HttpError as e:
             pass
