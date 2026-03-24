@@ -1,0 +1,1381 @@
+storefront.py:
+from __future__ import annotations
+import io
+import os
+from pathlib import Path
+import sys
+import json
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+
+import sys
+from pathlib import Path
+
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+DIRECT = "https://drive.google.com/uc?export=download&id="
+
+IDs = {}
+CHILDREN = {}
+TRACE_API_CALLS = False
+
+FILE_LOCATIONS = json.loads((SCRIPT_DIR / "file_locations.json").read_text())
+
+# ------------------------------------------------------------
+# AUTHENTICATION
+# ------------------------------------------------------------
+
+def auth():
+    token_path = SCRIPT_DIR / "token.json"
+    secret_path = SCRIPT_DIR / "client_secret.json"
+
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(secret_path, SCOPES)
+        creds = flow.run_local_server(port=0)
+        token_path.write_text(creds.to_json())
+
+    return build("drive", "v3", credentials=creds)
+
+drive = auth()
+
+if (TRACE_API_CALLS):
+    orig_files = drive.files  # this is a callable that returns a FilesResource
+
+    class FilesWrapper:
+        def __init__(self, real):
+            self._real = real
+
+        def list(self, *a, **kw):
+            print("Drive API CALL: files.list")
+            print("  kwargs:", kw)
+            return self._real.list(*a, **kw)
+
+        def create(self, *a, **kw):
+            print("Drive API CALL: files.create")
+            print("  kwargs:", kw)
+            return self._real.create(*a, **kw)
+
+        def update(self, *a, **kw):
+            print("Drive API CALL: files.update")
+            print("  kwargs:", kw)
+            return self._real.update(*a, **kw)
+
+        def get(self, *a, **kw):
+            print("Drive API CALL: files.get")
+            print("  kwargs:", kw)
+            return self._real.get(*a, **kw)
+
+        def get_media(self, *a, **kw):
+            print("Drive API CALL: files.get_media")
+            print("  kwargs:", kw)
+            return self._real.get_media(*a, **kw)
+    def wrapped_files():
+        return FilesWrapper(orig_files())
+
+    drive.files = wrapped_files
+# ------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------
+
+def is_drive_path(s) -> bool:
+    return str(s).startswith("drive:/")
+
+def drive_path_to_components(path: str):
+    """drive:/a/b/c.bin → ['a','b','c.bin']"""
+    return path[len("drive:/"):].strip("/").split("/")
+
+def find_child(parent_id: str, name: str):
+    """Find a file/folder named `name` inside folder `parent_id`, with caching."""
+
+    key = (parent_id, name)
+
+    # Fast path: cached positive result
+    if key in CHILDREN:
+        return CHILDREN[key]
+
+    # Escape single quotes for Drive query
+    safe_name = name.replace("'", "\\'")
+
+    q = (
+        f"'{parent_id}' in parents and "
+        f"name = '{safe_name}' and trashed = false"
+    )
+
+    res = drive.files().list(
+        q=q,
+        fields="files(id, name, mimeType)"
+    ).execute()
+
+    files = res.get("files", [])
+    child = files[0] if files else None
+
+    if child is not None:
+        CHILDREN[key] = child
+
+    return child
+def resolve_drive_path(path: str) -> str | None:
+    """
+    Resolve drive:/a/b/c.bin → file ID.
+    Creates intermediate folders if needed.
+    Returns None if the final file does not exist.
+    """
+
+    # Fast path: full path already cached
+    if path in IDs:
+        return IDs[path]
+
+    parts = drive_path_to_components(path)
+    parent = "root"
+    prefix = "drive:/"
+
+    for i, part in enumerate(parts):
+        prefix = prefix + part if prefix == "drive:/" else prefix + "/" + part
+
+        # Cached prefix?
+        if prefix in IDs:
+            parent = IDs[prefix]
+            continue
+
+        # Not cached → check Drive
+        existing = find_child(parent, part)
+
+        if existing:
+            parent = existing["id"]
+        else:
+            if i < len(parts) - 1:
+                # Create intermediate folder
+                meta = {
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent]
+                }
+                folder = drive.files().create(body=meta, fields="id").execute()
+                parent = folder["id"]
+            else:
+                # Final file does not exist
+                return None
+
+        # Cache this prefix
+        IDs[prefix] = parent
+
+    # Cache full path
+    IDs[path] = parent
+    return parent
+# ------------------------------------------------------------
+# CORE FUNCTIONS (ID ONLY)
+# ------------------------------------------------------------
+
+def read(path_or_id: str) -> bytes:
+    """
+    Reads a file from Drive.
+    Accepts:
+      - drive:/path/to/file
+      - raw file ID
+    Returns raw bytes.
+    """
+    if is_drive_path(path_or_id):
+        file_id = resolve_drive_path(path_or_id)
+        if not file_id:
+            raise FileNotFoundError(path_or_id)
+    else:
+        file_id = path_or_id  # already an ID
+
+    req = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    return buf.getvalue().decode("utf-8")
+
+
+def create(local_path: str, drive_path: str | None = None) -> str:
+    """
+    Dual‑mode create():
+      1) create(local_path, drive_path):
+            Uploads a local file to a virtual Drive path.
+            Overwrites if the file already exists.
+            Returns the file ID.
+
+      2) create(drive_path):
+            Creates the folder chain described by drive_path.
+            Returns the final folder ID.
+    """
+
+    # ------------------------------------------------------------
+    # MODE 2: Folder creation (only one argument passed)
+    # ------------------------------------------------------------
+    if drive_path is None:
+        drive_path = local_path  # reinterpret argument
+
+        if not is_drive_path(drive_path):
+            raise ValueError("Folder creation requires a drive:/ path")
+
+        parts = drive_path_to_components(drive_path)
+        parent = "root"
+
+        for part in parts:
+            existing = find_child(parent, part)
+            if existing:
+                parent = existing["id"]
+            else:
+                meta = {
+                    "name": part,
+                    "mimeType": "application/vnd.google-apps.folder",
+                    "parents": [parent]
+                }
+                folder = drive.files().create(body=meta, fields="id").execute()
+                parent = folder["id"]
+
+        return parent  # final folder ID
+
+
+    # ------------------------------------------------------------
+    # MODE 1: File upload (two arguments passed)
+    # ------------------------------------------------------------
+    if not is_drive_path(drive_path):
+        raise ValueError("drive_path must start with drive:/")
+
+    parts = drive_path_to_components(drive_path)
+    filename = parts[-1]
+    folder_path = "drive:/" + "/".join(parts[:-1])
+
+    # Ensure folder exists
+    folder_id = resolve_drive_path(folder_path)
+    if folder_id is None:
+        resolve_drive_path(folder_path + "/__dummy__")
+        folder_id = resolve_drive_path(folder_path)
+
+    # Check if file already exists
+    existing = find_child(folder_id, filename)
+
+    media = MediaIoBaseUpload(
+        open(local_path, "rb"),
+        mimetype="application/octet-stream"
+    )
+
+    if existing:
+        # Overwrite existing file
+        file = drive.files().update(
+            fileId=existing["id"],
+            media_body=media,
+            fields="id"
+        ).execute()
+        return file["id"]
+
+    # Otherwise create a new file
+    meta = {"name": filename, "parents": [folder_id]}
+    file = drive.files().create(
+        body=meta,
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    return file["id"]
+
+def write(path_or_id: str, data: bytes) -> str:
+    """
+    Overwrites an existing Drive file.
+    Accepts:
+      - drive:/path/to/file
+      - raw file ID
+    Returns the file ID.
+    """
+    if is_drive_path(path_or_id):
+        file_id = resolve_drive_path(path_or_id)
+        if not file_id:
+            raise FileNotFoundError(path_or_id)
+    else:
+        file_id = path_or_id
+    if (type(data) == str):
+        data = data.encode("utf-8")
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype="application/octet-stream"
+    )
+
+    file = drive.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    return file["id"]
+
+def delete(drive_path_or_id: str) -> None:
+    """
+    Deletes a file or folder from Drive.
+    Accepts:
+      - drive:/path/to/item
+      - raw file/folder ID
+    """
+    # Resolve virtual path → ID
+    if is_drive_path(drive_path_or_id):
+        file_id = resolve_drive_path(drive_path_or_id)
+        if not file_id:
+            raise FileNotFoundError(drive_path_or_id)
+    else:
+        file_id = drive_path_or_id  # already an ID
+
+    # Perform the delete
+    drive.files().delete(fileId=file_id).execute()
+
+def add_file(path: str) -> str:
+    """
+    Uploads ref/empty to a Drive path.
+    Returns the file ID.
+    """
+    local = SCRIPT_DIR / "ref" / "empty"
+    return create(local, path)
+
+def get_folders(root: str) -> list[str]:
+    root = Path(root)
+    results = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = str(Path(dirpath).relative_to(root))
+        if (not (len(rel) == 0 or len(rel) == 1)):
+            results.append(str(rel).replace("\\", "/"))  # Normalize to forward slashes
+
+    return results
+def get_files(root: str) -> list[str]:
+    root = Path(root)
+    results = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            full = Path(dirpath) / filename
+            rel = full.relative_to(root)
+            results.append(rel.as_posix())  # normalize to forward slashes
+
+    return results
+def parent_json_path(path: str) -> str:
+    """
+    Converts any path of the form:
+        drive:/<prefix...>/<parent>/<folder>/<folder>.json
+    Into:
+        drive:/<prefix...>/<parent>/<parent>.json
+    """
+    if not is_drive_path(path):
+        raise ValueError("Expected a drive:/ path")
+
+    parts = drive_path_to_components(path)
+
+    # Need at least: <parent>/<folder>/<file>
+    if len(parts) < 3:
+        raise ValueError("Path too short to transform")
+
+    parent = parts[-3]
+
+    # prefix = everything before <parent>
+    prefix = parts[:-3]
+
+    new_parts = prefix + [parent, parent + ".json"]
+
+    return "drive:/" + "/".join(new_parts)
+def local_json_path(path: str) -> str:
+    """
+    Given a path of the form:
+        drive:/<prefix...>/<parent>/<folder>/<folder>.json
+
+    Return the local JSON path:
+        drive:/<prefix...>/<parent>/<folder>/<folder>.json
+    (i.e., the JSON for the folder itself)
+    """
+    if not is_drive_path(path):
+        raise ValueError("Expected a drive:/ path")
+
+    parts = drive_path_to_components(path)
+
+    # Need at least: <parent>/<folder>/<file>
+    if len(parts) < 3:
+        raise ValueError("Path too short to transform")
+
+    folder = parts[-2]      # the folder name
+    prefix = parts[:-2]     # everything before <folder>
+
+    new_parts = prefix + [folder, folder + ".json"]
+
+    return "drive:/" + "/".join(new_parts)
+
+def dict_to_json(d: dict) -> str:
+    return json.dumps(d, ensure_ascii=False, indent=2)
+
+def join_json(a: str, b: str) -> str:
+    dict_a = json.loads(a) if a.strip() else {}
+    dict_b = json.loads(b) if b.strip() else {}
+    merged = {**dict_a, **dict_b}
+    return json.dumps(merged, ensure_ascii=False, indent=2)
+
+def create_structure(local_path):
+    folders = get_folders(local_path)
+    name = Path(local_path).name
+    local_drive_path = "drive:/3DS Storefront/" + name
+    storefront_id = add_file(local_drive_path + "/"+name+".json")
+    for folder in folders:
+        print("Processing folder:", folder)
+        name = Path(folder).name
+        drive_folder_path = local_drive_path + "/" + folder
+        file_path = drive_folder_path + "/"+name+".json"
+        parent_json = parent_json_path(file_path)
+        parent_id = resolve_drive_path(parent_json)
+        json_dict = {
+            "<parent directory>":[
+                parent_id,
+                "storefront"
+            ]
+        }
+        with open("temp", "w") as f:
+            f.write(dict_to_json(json_dict))
+        create("temp", file_path)
+        os.remove("temp")
+        json_dict = {
+            name:[
+                resolve_drive_path(file_path),
+                "storefront"
+            ]
+        }
+        json_string = dict_to_json(json_dict)
+        parent_json_data = read(parent_json)
+        json_string = join_json(parent_json_data, json_string)
+        write(parent_json, json_string.encode("utf-8"))
+        print(f"Created folder: {drive_folder_path}")
+    return storefront_id
+
+def list_remote_tree(root_drive_path):
+    """
+    Returns:
+      remote_folders: set of canonical folder paths
+      remote_files: set of canonical file paths
+    """
+    name = Path(root_drive_path).name
+    root_json = f"{root_drive_path}/{name}.json"
+
+    remote_folders = set()
+    remote_files = set()
+
+    # BFS through JSON manifests
+    queue = [(root_drive_path, root_json)]
+
+    while queue:
+        folder_drive_path, json_path = queue.pop(0)
+
+        data = read(json_path)
+        d = json.loads(data)
+
+        for key, value in d.items():
+            if key == "<parent directory>":
+                continue
+
+            # Folder entry
+            if value[1] == "storefront":
+                child_folder = f"{folder_drive_path}/{key}"
+                remote_folders.add(child_folder)
+
+                child_json = f"{child_folder}/{key}.json"
+                queue.append((child_folder, child_json))
+
+            # File entry
+            else:
+                filename = value[1]  # ALWAYS use the filename with extension
+                remote_files.add(f"{folder_drive_path}/{filename}")
+
+    return remote_folders, remote_files
+def push(local_path, add_only=False):
+    name = Path(local_path).name
+    root_drive_path = f"drive:/3DS Storefront/{name}"
+    root_json = f"{root_drive_path}/{name}.json"
+
+    # Ensure root JSON exists
+    resolve_drive_path(root_drive_path)
+    if resolve_drive_path(root_json) is None:
+        add_file(root_json)
+
+    # ------------------------------------------------------------
+    # 1. Incremental folder creation (fixed)
+    # ------------------------------------------------------------
+    for folder in get_folders(local_path):
+        print("Processing folder:", folder)
+        folder_name = Path(folder).name
+
+        # Local parent (e.g. "." for top-level, "folder1" for "folder1/test_folder1")
+        local_parent = Path(folder).parent.as_posix()
+        if local_parent == ".":
+            parent_folder_drive = root_drive_path
+        else:
+            parent_folder_drive = f"{root_drive_path}/{local_parent}"
+
+        drive_folder_path = f"{root_drive_path}/{folder}"
+        folder_json_path = f"{drive_folder_path}/{folder_name}.json"
+
+        # Get the *folder* that should contain this folder
+        parent_folder_id = resolve_drive_path(parent_folder_drive)
+
+        # Correct existence check: is there already a child named folder_name under parent_folder_id?
+        existing = find_child(parent_folder_id, folder_name)
+        if existing:
+            # Folder already exists on Drive → skip
+            continue
+
+        # Folder missing → create its JSON and parent JSON entry
+        parent_json = parent_json_path(folder_json_path)
+        parent_json_id = resolve_drive_path(parent_json)
+
+        json_dict = {
+            "<parent directory>": [
+                parent_json_id,
+                "storefront"
+            ]
+        }
+
+        with open("temp", "w") as f:
+            f.write(dict_to_json(json_dict))
+        create("temp", folder_json_path)
+        os.remove("temp")
+
+        # Add folder entry to parent JSON
+        entry = {
+            folder_name: [
+                resolve_drive_path(folder_json_path),
+                "storefront"
+            ]
+        }
+
+        parent_json_data = read(parent_json)
+        parent_dict = json.loads(parent_json_data)
+
+        if folder_name not in parent_dict:
+            parent_dict.update(entry)
+            write(parent_json, json.dumps(parent_dict, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+    # ------------------------------------------------------------
+    # 2. Incremental file upload
+    # ------------------------------------------------------------
+    for file in get_files(local_path):
+        print("Processing file:", file)
+        drive_file_path = f"{root_drive_path}/{file}"
+        local_file_path = Path(local_path) / file
+
+        folder_json = local_json_path(drive_file_path)
+        folder_id = resolve_drive_path(Path(folder_json).parent.as_posix())
+
+        file_name = Path(file).name
+
+        # Check if file already exists
+        existing = find_child(folder_id, file_name)
+        if existing:
+            # File exists → skip upload
+            continue
+
+        # Upload file
+        file_id = create(str(local_file_path), drive_file_path)
+
+        # Update folder JSON
+        folder_json_data = read(folder_json)
+        folder_dict = json.loads(folder_json_data)
+
+        key = file_name.split(".")[0]
+        if key not in folder_dict:
+            folder_dict[key] = [
+                DIRECT + file_id,
+                file_name,
+                FILE_LOCATIONS.get(Path(file).suffix.lower(), "/3DS Storefront/Other")
+            ]
+            write(folder_json, json.dumps(folder_dict, ensure_ascii=False, indent=2).encode("utf-8"))
+
+    # ------------------------------------------------------------
+    # 3. Delete remote items not present locally
+    # ------------------------------------------------------------
+    if not add_only:
+        # Build local sets (full drive paths including filenames)
+        local_folders = {f"{root_drive_path}/{f}" for f in get_folders(local_path)}
+        local_files = {f"{root_drive_path}/{f}" for f in get_files(local_path)}
+
+        # Build remote sets (from JSON only)
+        remote_folders, remote_files = list_remote_tree(root_drive_path)
+
+        # --- DELETE FOLDERS ---
+        folders_to_delete = sorted(remote_folders - local_folders, key=lambda p: p.count("/"), reverse=True)
+
+        for folder in folders_to_delete:
+            print("Processing folder:", folder)
+            folder_name = Path(folder).name
+            folder_json = f"{folder}/{folder_name}.json"
+            parent_json = parent_json_path(folder_json)
+
+            # Remove from parent JSON
+            parent_dict = json.loads(read(parent_json))
+            if folder_name in parent_dict:
+                del parent_dict[folder_name]
+                write(parent_json, dict_to_json(parent_dict).encode("utf-8"))
+
+            delete(folder_json)
+            delete(folder)
+
+        # --- DELETE FILES ---
+        files_to_delete = remote_files - local_files
+
+        for file in files_to_delete:
+            print("Processing file:", file)
+            file_name = Path(file).name
+            folder_json = local_json_path(file)
+
+            parent_dict = json.loads(read(folder_json))
+
+            key = file_name.split(".")[0]
+            if key in parent_dict:
+                del parent_dict[key]
+                write(folder_json, dict_to_json(parent_dict).encode("utf-8"))
+
+            delete(file)
+
+def add_files(local_path):
+    files = get_files(local_path)
+    name = Path(local_path).name
+    local_drive_path = "drive:/3DS Storefront/" + name
+    for file in files:
+        print("Processing file:", file)
+        drive_file_path = local_drive_path + "/" + file
+        local_file_path = Path(local_path) / file
+        create(str(local_file_path), drive_file_path)
+        json_path = local_json_path(drive_file_path)
+        file_name = Path(file).name
+        json_dict = {
+            file_name.split(".")[0]:[
+                DIRECT+resolve_drive_path(drive_file_path),
+                file_name,
+                FILE_LOCATIONS.get(Path(file).suffix.lower(), "/3DS Storefront/Other")
+            ]
+        }
+        curr_json_data = read(json_path)
+        json_string = join_json(curr_json_data, dict_to_json(json_dict))
+        write(json_path, json_string.encode("utf-8"))
+        print(f"Added file: {drive_file_path}")
+
+if __name__ == "__main__":
+    for i in range(10):
+        try:
+            if (len(sys.argv) < 3 or len(sys.argv) > 4):
+                print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+                sys.exit(0)
+            elif (len(sys.argv) == 4):
+                if (sys.argv[3] != "--add-only"):
+                    print("Usage: \nstorefront create <local_storefront_path>\nstorefront push <local_storefront_path> (--add-only)\nstorefront delete <storefront_name>")
+                    sys.exit(0)
+            command = sys.argv[1]
+            if (command == "create"):
+                local_path = sys.argv[2]
+                storefront_id = create_structure(local_path)
+                add_files(local_path)
+                print(f"Storefront created with ID: {storefront_id}")
+                sys.exit(0)
+            elif (command == "push"):
+                local_path = sys.argv[2]
+                add_only = (len(sys.argv) == 4 and sys.argv[3] == "--add-only")
+                push(local_path, add_only)
+                sys.exit(0)
+        except drive.errors.HttpError as e:
+            pass
+
+
+main.cpp:
+#include <3ds.h>
+#include <stdio.h>
+#include "DownloadFromURL.hpp"
+#include "input.hpp"
+#include "rw.hpp"
+#include "json.hpp"
+#include "string.hpp"
+using json = nlohmann::ordered_json;
+int VISIBLE_COUNT;
+const std::string domain = "https://drive.google.com/uc?export=download&id=";
+const std::string defaultStore = "1m99FhKG-zpNd7VoAOjFV11dyJsDbnUv9";
+
+void printMenu(const std::vector<std::string>& list, int selected) {
+    consoleClear();
+
+    int total = list.size();
+
+    // Compute window start
+    int half = VISIBLE_COUNT / 2;
+    int start = selected - half;
+    if (start < 0) start = 0;
+    if (start + VISIBLE_COUNT > total)
+        start = std::max(0, total - VISIBLE_COUNT);
+
+    // Print only the visible slice
+    for (int i = start; i < start + VISIBLE_COUNT && i < total; i++) {
+        if (i == selected)
+            printf(">%s\n", list[i].c_str());
+        else
+            printf(" %s\n", list[i].c_str());
+    }
+}
+
+int main(int argc, char** argv)
+{
+    gfxInitDefault();
+    PrintConsole topScreen, bottomScreen;
+    consoleInit(GFX_TOP, &topScreen);
+    VISIBLE_COUNT = topScreen.consoleHeight-1;
+    consoleInit(GFX_BOTTOM, &bottomScreen);
+    consoleSelect(&topScreen);
+    fsInit();
+    httpcInit(0);
+    std::string store_url = readFile("/3ds/3DS-Storefront/store.3sf");
+    std::string default_store_url = readFile("/3ds/3DS-Storefront/default_store.3sf");
+    std::string prev_store_url = readFile("/3ds/3DS-Storefront/prev_store.3sf");
+    if (default_store_url.empty())
+    {
+        writeFile("/3ds/3DS-Storefront/default_store.3sf", defaultStore);
+    }
+    if (prev_store_url.empty())
+    {
+        writeFile("/3ds/3DS-Storefront/prev_store.3sf", defaultStore);
+    }
+    if (store_url.empty())
+    {
+        writeFile("/3ds/3DS-Storefront/store.3sf", defaultStore);
+        store_url = defaultStore;
+    }
+    printf("Loading...\n");
+    bool downloadSuccess = downloadURL(domain+store_url, "/3ds/3DS-Storefront", "storefront.json");
+    if (!downloadSuccess)
+    {
+        consoleClear();
+        printf("Failed to load storefront %s\nWill use previous storefront.\n\nPress any button to continue.", store_url.c_str());
+        while (aptMainLoop())
+        {
+            hidScanInput();
+            if (hidKeysDown()) break;
+            gspWaitForVBlank();
+        }
+    }
+    std::string jsonContent = readFile("/3ds/3DS-Storefront/storefront.json");
+    json storeJson = json::parse(jsonContent, nullptr, false);
+    std::vector<std::string> keys;
+    for (auto& el : storeJson.items()) {
+        keys.push_back(el.key());
+    }
+    std::vector<std::string> stores;
+    for (int i = 0; i < (int)keys.size(); i++)
+    {
+        if ((std::string)(storeJson[keys[i]][1]) == "storefront")
+        {
+            stores.push_back(keys[i]);
+        }
+    }
+    int selected = 0;
+    printMenu(keys, selected);
+    consoleSelect(&bottomScreen);
+    printf("Use UP/DOWN to navigate.\nPress A to download.\nPress X to change storefront.\nPress START to exit.\nPress SELECT to return to previous storefront.\nPress Y to return to default storefront.\nPress L to to save storefront.\nPress R to to load storefront.\n");
+    consoleSelect(&topScreen);
+    while (aptMainLoop())
+    {
+        hidScanInput();
+        if (hidKeysDown() & KEY_START)
+        {
+            aptExit();
+            svcExitProcess();
+        }
+        if (hidKeysDown() & KEY_L)
+        {
+            std::string save_name = getTextInput("Enter store save name:", 256);
+            if (!save_name.empty())
+            {
+                std::string curr_save = readFile("/3ds/3DS-Storefront/saves.3sf");
+                writeFile("/3ds/3DS-Storefront/saves.3sf", curr_save + save_name + ":" + store_url + "\n");
+            }
+        }
+        if (hidKeysDown() & KEY_R)
+        {
+            std::string saved_stores = readFile("/3ds/3DS-Storefront/saves.3sf");
+            consoleClear();
+            std::vector<std::string> lines = split(saved_stores, '\n');
+            std::unordered_map<std::string, std::string> save_map;
+            std::vector<std::string> names;
+            for (int i = 0; i < (int)lines.size()-1; i++)
+            {
+                size_t colon_pos = lines[i].find(':');
+                if (colon_pos != std::string::npos)
+                {
+                    std::string name = lines[i].substr(0, colon_pos);
+                    names.push_back(name);
+                    std::string url = lines[i].substr(colon_pos + 1);
+                    save_map[name] = url;
+                }
+            }
+            int selected_save = 0;
+            printMenu(names, selected_save);
+            while (aptMainLoop())
+            {
+                hidScanInput();
+                if (hidKeysDown() & KEY_START)
+                {
+                    aptExit();
+                    svcExitProcess();
+                }
+                if (hidKeysDown() & KEY_DOWN){
+                    selected_save++;
+                    if (selected_save >= (int)names.size()){
+                        selected_save = 0;
+                    }
+                    printMenu(names, selected_save);
+                }
+                if (hidKeysDown() & KEY_UP){
+                    selected_save--;
+                    if (selected_save < 0){
+                        selected_save = names.size() - 1;
+                    }
+                    printMenu(names, selected_save);
+                }
+                if (hidKeysDown() & KEY_A){
+                    std::string selected_name = names[selected_save];
+                    std::string selected_url = save_map[selected_name];
+                    writeFile("/3ds/3DS-Storefront/store.3sf", selected_url);
+                    consoleClear();
+                    printf("Loading...\n");
+                    consoleSelect(&bottomScreen);
+                    consoleClear();
+                    consoleSelect(&topScreen);
+                    httpcExit();
+                    gfxExit();
+                    main(0, nullptr);
+                    return 0;
+                }
+            }
+        }
+        if (hidKeysDown() & KEY_DOWN){
+            selected++;
+            if (selected >= (int)keys.size()){
+                selected = 0;
+            }
+            printMenu(keys, selected);
+        }
+        if (hidKeysDown() & KEY_LEFT){
+            selected-=5;
+            if (selected < 0){
+                selected = keys.size() - 1;
+            }
+            printMenu(keys, selected);
+        }
+        if (hidKeysDown() & KEY_RIGHT){
+            selected+=5;
+            if (selected >= (int)keys.size()){
+                selected = 0;
+            }
+            printMenu(keys, selected);
+        }
+        if (hidKeysDown() & KEY_UP){
+            selected--;
+            if (selected < 0){
+                selected = keys.size() - 1;
+            }
+            printMenu(keys, selected);
+        }
+        if (hidKeysDown() & KEY_X)
+        {
+            std::string newUrl = getTextInput("Enter new store name:", 256);
+            if (!newUrl.empty())
+            {
+                writeFile("/3ds/3DS-Storefront/prev_store.3sf", store_url);
+                writeFile("/3ds/3DS-Storefront/store.3sf", newUrl);
+                consoleClear();
+                httpcExit();
+                gfxExit();
+                main(0, nullptr);
+                return 0;
+            }
+        }
+        if (hidKeysDown() & KEY_A){
+            if (storeJson[keys[selected]].size() < 3)
+            {
+                consoleClear();
+                consoleSelect(&bottomScreen);
+                consoleClear();
+                consoleSelect(&topScreen);
+                printf("Loading...\n");
+                writeFile("/3ds/3DS-Storefront/prev_store.3sf", store_url);
+                writeFile("/3ds/3DS-Storefront/store.3sf", (std::string)(storeJson[keys[selected]][0]));
+                consoleClear();
+                httpcExit();
+                gfxExit();
+                main(0, nullptr);
+                return 0;
+            }
+            else
+            {
+                std::string url = storeJson[keys[selected]][0];
+                std::string fileName = storeJson[keys[selected]][1];
+                consoleClear();
+                consoleSelect(&bottomScreen);
+                consoleClear();
+                consoleSelect(&topScreen);
+                printf("Downloading %s...\n", fileName.c_str());
+                std::string dir = storeJson[keys[selected]][2];
+                if (!fileName.empty()) {
+                    if (downloadURL(url, dir, fileName))
+                    {
+                        consoleClear();
+                        printf("Downloaded %s to %s.\n\nPress any button to continue.", fileName.c_str(), dir.c_str());
+                    }
+                    else
+                    {
+                        consoleClear();
+                        printf("Failed to download %s.\n", fileName.c_str());
+                    }
+                    while (aptMainLoop())
+                    {
+                        hidScanInput();
+                        if (hidKeysDown() & KEY_START)
+                        {
+                            aptExit();
+                            svcExitProcess();
+                        }
+                        if (hidKeysDown()) break;
+                        gspWaitForVBlank();
+                    }
+                    printMenu(keys, selected);
+                    consoleSelect(&bottomScreen);
+                    printf("Use UP/DOWN to navigate.\nPress A to download.\nPress X to change storefront.\nPress START to exit.\nPress SELECT to return to main storefront.\n");
+                    consoleSelect(&topScreen);
+                }
+            }
+        }
+        if (hidKeysDown() & KEY_SELECT) {
+            std::string prev = readFile("/3ds/3DS-Storefront/prev_store.3sf");
+            if (!prev.empty()) {
+                consoleClear();
+                printf("Loading...\n");
+                consoleSelect(&bottomScreen);
+                consoleClear();
+                consoleSelect(&topScreen);
+                writeFile("/3ds/3DS-Storefront/store.3sf", prev);
+                consoleClear();
+                httpcExit();
+                gfxExit();
+                main(0, nullptr);
+                return 0;
+            }
+        }
+        if (hidKeysDown() & KEY_Y) {
+            std::string prev = readFile("/3ds/3DS-Storefront/default_store.3sf");
+            if (!prev.empty()) {
+                consoleClear();
+                printf("Loading...\n");
+                consoleSelect(&bottomScreen);
+                consoleClear();
+                consoleSelect(&topScreen);
+                writeFile("/3ds/3DS-Storefront/store.3sf", prev);
+                consoleClear();
+                httpcExit();
+                gfxExit();
+                main(0, nullptr);
+                return 0;
+            }
+        }
+        gspWaitForVBlank();
+    }
+    httpcExit();
+    gfxExit();
+    return 0;
+}
+
+DownloadFromURL.cpp:
+#include <3ds.h>
+#include <stdio.h>
+#include <regex>
+bool downloadToBuffer(const std::string& url, std::vector<u8>& out, int redirectLimit = 5)
+{
+    if (redirectLimit <= 0)
+    {
+        return false;
+    }
+    Result res;
+    httpcContext ctx;
+    res = httpcOpenContext(&ctx, HTTPC_METHOD_GET, url.c_str(), 1);
+    if (R_FAILED(res)) return false;
+    res = httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify);
+    if (R_FAILED(res)) return false;
+    res = httpcAddRequestHeaderField(&ctx, "User-Agent", "3ds-downloader");
+    if (R_FAILED(res)) return false;
+    res = httpcBeginRequest(&ctx);
+    if (R_FAILED(res)) return false;
+    u32 status = 0;
+    res = httpcGetResponseStatusCode(&ctx, &status);
+    if (R_FAILED(res)) return false;
+    if (status >= 300 && status < 400)
+    {
+        char newUrl[1024*4] = {0};
+        res = httpcGetResponseHeader(&ctx, "Location", newUrl, sizeof(newUrl));
+        httpcCloseContext(&ctx);
+
+        if (R_FAILED(res))
+        {
+            return false;
+        }
+        return downloadToBuffer(std::string(newUrl), out, redirectLimit - 1);
+    }
+    if (status != 200)
+    {
+        httpcCloseContext(&ctx);
+        return false;
+    }
+    u32 size = 0;
+    res = httpcGetDownloadSizeState(&ctx, NULL, &size);
+    if (R_FAILED(res)) return false;
+    out.resize(size);
+    u32 pos = 0;
+    while (pos < size)
+    {
+        u32 read = 0;
+        res = httpcDownloadData(&ctx, &out[pos], size - pos, &read);
+        if (R_FAILED(res)) break;
+        pos += read;
+    }
+    httpcCloseContext(&ctx);
+    return pos == size;
+}
+void ensureDir(FS_Archive archive, const std::string& fullPath)
+{
+    size_t start = 1; // skip leading '/'
+    while (true)
+    {
+        size_t slash = fullPath.find('/', start);
+        if (slash == std::string::npos)
+            break;
+        std::string sub = fullPath.substr(0, slash + 1); // include trailing slash
+        FS_Path p = fsMakePath(PATH_ASCII, sub.c_str());
+        FSUSER_CreateDirectory(archive, p, 0);
+        start = slash + 1;
+    }
+    FS_Path p = fsMakePath(PATH_ASCII, fullPath.c_str());
+    FSUSER_CreateDirectory(archive, p, 0);
+}
+bool downloadToSD(const std::string& url, const std::string& outPath)
+{
+    std::vector<u8> buffer;
+    if (!downloadToBuffer(url, buffer))
+    {
+        return false;
+    }
+    Handle fileHandle;
+    FS_Path filePath  = fsMakePath(PATH_ASCII, outPath.c_str());
+    FS_Path archPath  = fsMakePath(PATH_EMPTY, ""); // SDMC root
+    Result res = FSUSER_OpenFileDirectly(
+        &fileHandle,
+        ARCHIVE_SDMC,
+        archPath,
+        filePath,
+        FS_OPEN_WRITE | FS_OPEN_CREATE,
+        0
+    );
+    if (R_FAILED(res))
+    {
+        return false;
+    }
+    u32 bytesWritten = 0;
+    res = FSFILE_Write(fileHandle, &bytesWritten, 0,buffer.data(), buffer.size(),FS_WRITE_FLUSH);
+    FSFILE_SetSize(fileHandle, buffer.size());
+    FSFILE_Close(fileHandle);
+    return R_SUCCEEDED(res) && bytesWritten == buffer.size();
+}
+bool downloadURL(const std::string& url, const std::string& dir, const std::string& fileName)
+{
+    std::string outFile = dir+"/"+fileName;
+    FS_Archive sdmcArchive;
+    FS_Path sdmcPath = fsMakePath(PATH_EMPTY, "");
+    FSUSER_OpenArchive(&sdmcArchive, ARCHIVE_SDMC, sdmcPath);
+    ensureDir(sdmcArchive, dir);
+    if (downloadToSD(url, outFile))
+        return true;
+    else
+        return false;
+}
+
+input.cpp:
+#include <3ds.h>
+#include <string>
+
+std::string getTextInput(const std::string& hint, int maxLen = 256)
+{
+    SwkbdState swkbd;
+    swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, maxLen);
+    swkbdSetHintText(&swkbd, hint.c_str());
+
+    static char buffer[257] = {0};
+    SwkbdButton button = swkbdInputText(&swkbd, buffer, sizeof(buffer));
+
+    if (button == SWKBD_BUTTON_LEFT)
+        return "";
+
+    return std::string(buffer);
+}
+
+rw.cpp:
+#include <3ds.h>
+#include <stdio.h>
+#include <string>
+#include "DownloadFromURL.hpp"
+std::string readFile(const std::string& path)
+{
+    Handle file;
+    FS_Path filePath = fsMakePath(PATH_ASCII, path.c_str());
+    FS_Path archPath = fsMakePath(PATH_EMPTY, "");
+
+    Result res = FSUSER_OpenFileDirectly(
+        &file,
+        ARCHIVE_SDMC,
+        archPath,
+        filePath,
+        FS_OPEN_READ,
+        0
+    );
+
+    if (R_FAILED(res))
+        return "";
+
+    u64 size = 0;
+    FSFILE_GetSize(file, &size);
+
+    std::string out;
+    out.resize(size);
+
+    u32 bytesRead = 0;
+    FSFILE_Read(file, &bytesRead, 0, &out[0], size);
+
+    FSFILE_Close(file);
+    return out;
+}
+bool writeFile(const std::string& path, const std::string& data)
+{
+    FS_Archive sdmcArchive;
+    FS_Path sdmcPath = fsMakePath(PATH_EMPTY, "");
+    FSUSER_OpenArchive(&sdmcArchive, ARCHIVE_SDMC, sdmcPath);
+    // Extract directory portion
+    size_t lastSlash = path.find_last_of('/');
+    if (lastSlash != std::string::npos)
+    {
+        std::string dir = path.substr(0, lastSlash);
+        if (!dir.empty())
+        {
+            FS_Archive dirArchive;
+            FS_Path sdmcPath = fsMakePath(PATH_EMPTY, "");
+            FSUSER_OpenArchive(&dirArchive, ARCHIVE_SDMC, sdmcPath);
+            ensureDir(dirArchive, dir);
+            FSUSER_CloseArchive(dirArchive);
+        }
+    }
+
+    Handle file;
+    FS_Path filePath = fsMakePath(PATH_ASCII, path.c_str());
+    FS_Path archPath = fsMakePath(PATH_EMPTY, "");
+
+    Result res = FSUSER_OpenFileDirectly(
+        &file,
+        ARCHIVE_SDMC,
+        archPath,
+        filePath,
+        FS_OPEN_WRITE | FS_OPEN_CREATE,
+        0
+    );
+    if (R_FAILED(res))
+        return false;
+
+    FSFILE_SetSize(file, 0);
+
+    u32 bytesWritten = 0;
+    res = FSFILE_Write(file, &bytesWritten, 0,
+                       data.data(), data.size(),
+                       FS_WRITE_FLUSH);
+
+    FSFILE_Close(file);
+    FSUSER_CloseArchive(sdmcArchive);
+    return R_SUCCEEDED(res) && bytesWritten == data.size();
+}
+
+string.cpp:
+#include <3ds.h>
+#include <string>
+#include <vector>
+std::vector<std::string> split(const std::string& s, char delim) 
+{
+    std::vector<std::string> out;
+    std::string current;
+
+    for (char c : s) {
+        if (c == delim) {
+            out.push_back(current);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    out.push_back(current);
+    return out;
+}
+
+file_locations.json:
+{
+    ".mp3": "/3DS Storefront/Music",
+    ".mpa": "/3DS Storefront/Music",
+    ".wav": "/3DS Storefront/Music",
+    ".wma": "/3DS Storefront/Music",
+    ".wpl": "/3DS Storefront/Music",
+    ".ogg": "/3DS Storefront/Music",
+    ".mid": "/3DS Storefront/Music",
+    ".midi": "/3DS Storefront/Music",
+    ".flac": "/3DS Storefront/Music",
+    ".aac": "/3DS Storefront/Music",
+    ".m4a": "/3DS Storefront/Music",
+    ".aiff": "/3DS Storefront/Music",
+    ".aif": "/3DS Storefront/Music",
+    ".cda": "/3DS Storefront/Music",
+    ".png": "/3DS Storefront/Pictures",
+    ".jpg": "/3DS Storefront/Pictures",
+    ".jpeg": "/3DS Storefront/Pictures",
+    ".jfif": "/3DS Storefront/Pictures",
+    ".webp": "/3DS Storefront/Pictures",
+    ".bmp": "/3DS Storefront/Pictures",
+    ".gif": "/3DS Storefront/Pictures",
+    ".tiff": "/3DS Storefront/Pictures",
+    ".tif": "/3DS Storefront/Pictures",
+    ".heic": "/3DS Storefront/Pictures",
+    ".heif": "/3DS Storefront/Pictures",
+    ".ico": "/3DS Storefront/Pictures",
+    ".svg": "/3DS Storefront/Pictures",
+    ".mp4": "/3DS Storefront/Videos",
+    ".mov": "/3DS Storefront/Videos",
+    ".avi": "/3DS Storefront/Videos",
+    ".mkv": "/3DS Storefront/Videos",
+    ".wmv": "/3DS Storefront/Videos",
+    ".flv": "/3DS Storefront/Videos",
+    ".webm": "/3DS Storefront/Videos",
+    ".obj": "/3DS Storefront/3D Models",
+    ".fbx": "/3DS Storefront/3D Models",
+    ".stl": "/3DS Storefront/3D Models",
+    ".glb": "/3DS Storefront/3D Models",
+    ".dae": "/3DS Storefront/3D Models",
+    ".ply": "/3DS Storefront/3D Models",
+    ".step": "/3DS Storefront/3D Models",
+    ".stp": "/3DS Storefront/3D Models",
+    ".md": "/3DS Storefront/Documents",
+    ".txt": "/3DS Storefront/Documents",
+    ".pdf": "/3DS Storefront/Documents",
+    ".epub": "/3DS Storefront/Documents",
+    ".cbz": "/3DS Storefront/Documents",
+    ".cbr": "/3DS Storefront/Documents",
+    ".doc": "/3DS Storefront/Documents",
+    ".docx": "/3DS Storefront/Documents",
+    ".ppt": "/3DS Storefront/Documents",
+    ".pptx": "/3DS Storefront/Documents",
+    ".xls": "/3DS Storefront/Documents",
+    ".xlsx": "/3DS Storefront/Documents",
+    ".rtf": "/3DS Storefront/Documents",
+    ".psd": "/3DS Storefront/Documents",
+    ".zip": "/3DS Storefront/Archives",
+    ".rar": "/3DS Storefront/Archives",
+    ".7z": "/3DS Storefront/Archives",
+    ".tar": "/3DS Storefront/Archives",
+    ".gz": "/3DS Storefront/Archives",
+    ".xz": "/3DS Storefront/Archives",
+    ".bz2": "/3DS Storefront/Archives",
+    ".lz": "/3DS Storefront/Archives",
+    ".arj": "/3DS Storefront/Archives",
+    ".deb": "/3DS Storefront/Archives",
+    ".lzma": "/3DS Storefront/Archives",
+    ".pkg": "/3DS Storefront/Archives",
+    ".rpm": "/3DS Storefront/Archives",
+    ".z": "/3DS Storefront/Archives",
+    ".jar": "/3DS Storefront/Archives",
+    ".torrent": "/3DS Storefront/Archives",
+    ".cia": "/3DS Storefront/roms/Nintendo 3DS",
+    ".3ds": "/3DS Storefront/roms/Nintendo 3DS",
+    ".cci": "/3DS Storefront/roms/Nintendo 3DS",
+    ".cxi": "/3DS Storefront/roms/Nintendo 3DS",
+    ".3dsx": "/3ds",
+    ".app": "/3DS Storefront/roms",
+    ".nds": "/3DS Storefront/roms/Nintendo DS",
+    ".gba": "/3DS Storefront/roms/Nintendo Game Boy Advance",
+    ".gb": "/3DS Storefront/roms/Nintendo Game Boy",
+    ".gbc": "/3DS Storefront/roms/Nintendo Game Boy Color",
+    ".nes": "/3DS Storefront/roms/Nintendo Entertainment System",
+    ".sfc": "/3DS Storefront/roms/Nintendo Super Nintendo Entertainment System",
+    ".smc": "/3DS Storefront/roms/Nintendo Super Nintendo Entertainment System",
+    ".apk": "/3DS Storefront/roms/Android",
+    ".py": "/3DS Storefront/Scripts",
+    ".js": "/3DS Storefront/Scripts",
+    ".json": "/3DS Storefront/Scripts",
+    ".xml": "/3DS Storefront/Scripts",
+    ".yaml": "/3DS Storefront/Scripts",
+    ".yml": "/3DS Storefront/Scripts",
+    ".css": "/3DS Storefront/Scripts",
+    ".html": "/3DS Storefront/Scripts",
+    ".xhtml": "/3DS Storefront/Scripts",
+    ".htm": "/3DS Storefront/Scripts",
+    ".scss": "/3DS Storefront/Scripts",
+    ".cpp": "/3DS Storefront/Scripts",
+    ".c": "/3DS Storefront/Scripts",
+    ".h": "/3DS Storefront/Scripts",
+    ".hpp": "/3DS Storefront/Scripts",
+    ".java": "/3DS Storefront/Scripts",
+    ".cs": "/3DS Storefront/Scripts",
+    ".rb": "/3DS Storefront/Scripts",
+    ".php": "/3DS Storefront/Scripts",
+    ".go": "/3DS Storefront/Scripts",
+    ".swift": "/3DS Storefront/Scripts",
+    ".kt": "/3DS Storefront/Scripts",
+    ".rs": "/3DS Storefront/Scripts",
+    ".rss": "/3DS Storefront/Scripts",
+    ".pl": "/3DS Storefront/Scripts",
+    ".sh": "/3DS Storefront/Scripts",
+    ".bat": "/3DS Storefront/Scripts",
+    ".ps1": "/3DS Storefront/Scripts",
+    ".lua": "/3DS Storefront/Scripts",
+    ".ahk": "/3DS Storefront/Scripts",
+    ".make": "/3DS Storefront/Scripts",
+    ".mk": "/3DS Storefront/Scripts",
+    ".makefile": "/3DS Storefront/Scripts",
+    ".csv": "/3DS Storefront/Scripts",
+    ".asp": "/3DS Storefront/Scripts",
+    ".aspx": "/3DS Storefront/Scripts",
+    ".rdmnd": "/3DS Storefront/Scripts",
+    ".lx": "/3DS Storefront/Scripts",
+    ".cgi": "/3DS Storefront/Scripts",
+    ".jsp": "/3DS Storefront/Scripts",
+    ".class": "/3DS Storefront/Scripts",
+    ".frag": "/3DS Storefront/Scripts",
+    ".vert": "/3DS Storefront/Scripts",
+    ".vb": "/3DS Storefront/Scripts",
+    ".exe": "/3DS Storefront/binaries",
+    ".dll": "/3DS Storefront/binaries",
+    ".bin": "/3DS Storefront/binaries",
+    ".sys": "/3DS Storefront/binaries",
+    ".img": "/3DS Storefront/binaries",
+    ".dmg": "/3DS Storefront/binaries",
+    ".iso": "/3DS Storefront/binaries",
+    ".toast": "/3DS Storefront/binaries",
+    ".vcd": "/3DS Storefront/binaries",
+    ".o": "/3DS Storefront/binaries",
+    ".dat": "/3DS Storefront/binaries",
+    ".log": "/3DS Storefront/binaries",
+    ".sav": "/3DS Storefront/binaries",
+    ".msi": "/3DS Storefront/binaries",
+    ".dmp": "/3DS Storefront/binaries",
+    ".drv": "/3DS Storefront/binaries",
+    ".tmp": "/3DS Storefront/binaries",
+    ".ttf": "/3DS Storefront/fonts",
+    ".otf": "/3DS Storefront/fonts",
+    ".url": "/3DS Storefront/Links",
+    ".lnk": "/3DS Storefront/Links"
+}
